@@ -1,10 +1,32 @@
 #!/bin/bash
 
+set -e  # Exit immediately if a command exits with a non-zero status
+set -x  # Print commands and their arguments as they are executed 
+# maybe printing commands and arguments as they are executed is not a good thing, creates a lot of lines and makes it hard to keep track of progress
+
+# Set up Spack
+source /n/home00/abakirbas/Desktop/spack/share/spack/setup-env.sh || { echo "Failed to source Spack"; exit 1; }
+
+# Create and activate Spack environment (if it doesn't exist)
+if ! spack env list | grep -q rnaseq_env; then
+    spack env create rnaseq_env || { echo "Failed to create Spack environment"; exit 1; }
+fi
+spack env activate rnaseq_env || { echo "Failed to activate Spack environment"; exit 1; }
+
+# Install packages (if not already installed)
+if ! spack find fastqc hisat2 stringtie samtools transdecoder > /dev/null 2>&1; then
+    spack add fastqc hisat2 stringtie samtools transdecoder || { echo "Failed to add packages"; exit 1; }
+    spack install || { echo "Failed to install packages"; exit 1; }
+fi
+
+# Load packages
+spack load fastqc hisat2 stringtie samtools transdecoder || { echo "Failed to load packages"; exit 1; }
+
 # Set variables
-GENOME="/path/to/your/denovo_assembled_genome.fasta"
-READS_DIR="/path/to/your/reads_directory"
-OUTPUT_DIR="/path/to/your/output_directory"
-SCRIPTS_DIR="/path/to/your/scripts_directory"
+GENOME="/n/holylfs05/LABS/informatics/Everyone/bcaapi/pacbio_hifi_assembly-main/workflow/b_caapi_combined_reads.fastq.gz"
+READS_DIR="/n/holylfs05/LABS/informatics/Everyone/bcaapi/Caapi_RNA_20221216"
+OUTPUT_DIR="/n/holyscratch01/davis_lab/abakirbas"
+SCRIPTS_DIR="/n/holyscratch01/davis_lab/abakirbas/scripts"
 
 # Create output and scripts directories
 mkdir -p $OUTPUT_DIR $SCRIPTS_DIR
@@ -19,17 +41,15 @@ while read sample; do
 #SBATCH --job-name=rnaseq_${sample##*/}
 #SBATCH --output=${OUTPUT_DIR}/logs/rnaseq_${sample##*/}_%j.out
 #SBATCH --error=${OUTPUT_DIR}/logs/rnaseq_${sample##*/}_%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
-#SBATCH --partition=your_partition_name
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=64G
+#SBATCH --partition=sapphire
 
-# Load necessary modules (adjust these based on your HPC environment)
-module load fastqc
-module load hisat2
-module load stringtie
-module load samtools
+# load packages
+spack env activate rnaseq_env
+spack load fastqc hisat2 stringtie samtools
 
 # Set variables
 GENOME="$GENOME"
@@ -60,6 +80,9 @@ stringtie \${OUTPUT_DIR}/\${SAMPLE}.sorted.bam \
 # Remove intermediate SAM file to save space
 rm \${OUTPUT_DIR}/\${SAMPLE}.sam
 
+# Deactivate Spack environment
+spack env deactivate
+
 EOF
 
     # Submit the job and store the job ID
@@ -73,15 +96,15 @@ cat << EOF > ${SCRIPTS_DIR}/merge_and_transdecoder.sh
 #SBATCH --job-name=merge_transdecoder
 #SBATCH --output=${OUTPUT_DIR}/logs/merge_transdecoder_%j.out
 #SBATCH --error=${OUTPUT_DIR}/logs/merge_transdecoder_%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --partition=your_partition_name
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=64G
+#SBATCH --partition=sapphire
 
 # Load necessary modules
-module load stringtie
-module load transdecoder
+spack env activate rnaseq_env
+spack load stringtie transdecoder
 
 # Merge GTF files
 stringtie --merge -p \$SLURM_CPUS_PER_TASK \
@@ -94,6 +117,9 @@ TransDecoder.LongOrfs -t merged.gtf
 TransDecoder.Predict -t merged.gtf
 
 echo "RNA-seq analysis complete!"
+# Deactivate Spack environment
+spack env deactivate
+
 EOF
 
 # Submit the merge and TransDecoder job with dependency on all sample jobs
@@ -107,14 +133,23 @@ if [ ! -f ${GENOME}.1.ht2 ]; then
 #SBATCH --job-name=hisat2_index
 #SBATCH --output=${OUTPUT_DIR}/logs/hisat2_index_%j.out
 #SBATCH --error=${OUTPUT_DIR}/logs/hisat2_index_%j.err
-#SBATCH --time=4:00:00
+#SBATCH --time=12:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --partition=your_partition_name
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=64G
+#SBATCH --partition=sapphire
 
-module load hisat2
+# load packages
+spack env activate rnaseq_env
+spack load hisat2
 
 hisat2-build $GENOME ${GENOME%.*}_index
+
+# Deactivate Spack environment
+spack env deactivate
+
 EOF
 fi
+
+# Deactivate Spack environment
+spack env deactivate
