@@ -47,3 +47,5 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+submit_rnaseq_analysis_problematic.sh
+Bcaapi_stringtie.sh

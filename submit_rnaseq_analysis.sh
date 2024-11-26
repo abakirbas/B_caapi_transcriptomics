@@ -1,8 +1,8 @@
 #!/bin/bash
 
 set -e  # Exit immediately if a command exits with a non-zero status
-set -x  # Print commands and their arguments as they are executed 
-# maybe printing commands and arguments as they are executed is not a good thing, creates a lot of lines and makes it hard to keep track of progress
+# Uncomment the following line to print commands and their arguments as they are executed
+# set -x
 
 # Set up Spack
 source /n/home00/abakirbas/Desktop/spack/share/spack/setup-env.sh || { echo "Failed to source Spack"; exit 1; }
@@ -23,79 +23,117 @@ fi
 spack load fastqc hisat2 stringtie samtools transdecoder || { echo "Failed to load packages"; exit 1; }
 
 # Set variables
-GENOME="/n/holylfs05/LABS/informatics/Everyone/bcaapi/pacbio_hifi_assembly-main/workflow/b_caapi_combined_reads.fastq.gz"
-READS_DIR="/n/holylfs05/LABS/informatics/Everyone/bcaapi/Caapi_RNA_20221216"
-OUTPUT_DIR="/n/holyscratch01/davis_lab/abakirbas"
-SCRIPTS_DIR="/n/holyscratch01/davis_lab/abakirbas/scripts"
+GENOME="/n/netscratch/davis_lab/Everyone/abakirbas/b_caapi.p_ctg.fa"
+READS_DIR="/n/netscratch/davis_lab/Everyone/abakirbas/Caapi_RNA_20221216"
+OUTPUT_DIR="/n/netscratch/davis_lab/Everyone/abakirbas"
+SCRIPTS_DIR="/n/netscratch/davis_lab/Everyone/abakirbas/scripts"
 
 # Create output and scripts directories
-mkdir -p $OUTPUT_DIR $SCRIPTS_DIR
+mkdir -p "$OUTPUT_DIR" "$SCRIPTS_DIR"
+mkdir -p "${OUTPUT_DIR}/fastqc"
+mkdir -p "${OUTPUT_DIR}/aligned"
+mkdir -p "${OUTPUT_DIR}/assembled"
+mkdir -p "${OUTPUT_DIR}/logs"
 
-# Create a sample list
-ls ${READS_DIR}/*_R1.fastq.gz | sed 's/_R1.fastq.gz//' > ${SCRIPTS_DIR}/sample_list.txt
+# Create a sample list with full file names
+find "${READS_DIR}" -name "*_R1_001.fastq.gz" | sort > "${SCRIPTS_DIR}/sample_list_R1.txt"
+find "${READS_DIR}" -name "*_R2_001.fastq.gz" | sort > "${SCRIPTS_DIR}/sample_list_R2.txt"
+paste "${SCRIPTS_DIR}/sample_list_R1.txt" "${SCRIPTS_DIR}/sample_list_R2.txt" > "${SCRIPTS_DIR}/sample_list_full.txt"
+
+# Clear previous job IDs file
+> "${SCRIPTS_DIR}/sample_job_ids.txt"
 
 # Generate individual sample job scripts
-while read sample; do
-    cat << EOF > ${SCRIPTS_DIR}/process_${sample##*/}.sh
+while read R1 R2; do
+    SAMPLE=$(basename "$R1" _R1_001.fastq.gz)
+    cat << EOF > "${SCRIPTS_DIR}/process_${SAMPLE}.sh"
 #!/bin/bash
-#SBATCH --job-name=rnaseq_${sample##*/}
-#SBATCH --output=${OUTPUT_DIR}/logs/rnaseq_${sample##*/}_%j.out
-#SBATCH --error=${OUTPUT_DIR}/logs/rnaseq_${sample##*/}_%j.err
+#SBATCH --job-name=rnaseq_${SAMPLE}
+#SBATCH --output="${OUTPUT_DIR}/logs/rnaseq_${SAMPLE}_%j.out"
+#SBATCH --error="${OUTPUT_DIR}/logs/rnaseq_${SAMPLE}_%j.err"
 #SBATCH --time=16:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=20
 #SBATCH --mem=64G
 #SBATCH --partition=sapphire
 
-# load packages
-spack env activate rnaseq_env
+# Load packages
+source /n/home00/abakirbas/Desktop/spack/share/spack/setup-env.sh
+# Activate Spack environment in the current shell
+eval "$(spack env activate --sh rnaseq_env)"
 spack load fastqc hisat2 stringtie samtools
 
 # Set variables
-GENOME="$GENOME"
-READS_DIR="$READS_DIR"
-OUTPUT_DIR="$OUTPUT_DIR"
-SAMPLE="${sample##*/}"
+GENOME="${GENOME}"
+OUTPUT_DIR="${OUTPUT_DIR}"
+R1_FILE="${R1}"
+R2_FILE="${R2}"
+SAMPLE="${SAMPLE}"
+
+# Verify SLURM_CPUS_PER_TASK
+echo "SLURM_CPUS_PER_TASK = \$SLURM_CPUS_PER_TASK"
+if [ -z "\$SLURM_CPUS_PER_TASK" ]; then
+    SLURM_CPUS_PER_TASK=20  # Set to the value specified in SBATCH directives
+    echo "SLURM_CPUS_PER_TASK was unset. Setting it to \$SLURM_CPUS_PER_TASK."
+fi
+
+# Check if HISAT2 index exists, if not create it
+if [ ! -f "\${GENOME%.*}_index.1.ht2" ]; then
+    echo "Creating HISAT2 index..."
+    hisat2-build "\$GENOME" "\${GENOME%.*}_index"
+fi
 
 # FastQC
-fastqc ${READS_DIR}/${SAMPLE}_R1.fastq.gz ${READS_DIR}/${SAMPLE}_R2.fastq.gz -o ${OUTPUT_DIR}/fastqc
+fastqc "\$R1_FILE" "\$R2_FILE" -o "\${OUTPUT_DIR}/fastqc"
 
 # HISAT2 alignment
-hisat2 -p \$SLURM_CPUS_PER_TASK \
-    -x \${GENOME%.*}_index \
-    -1 \${READS_DIR}/\${SAMPLE}_R1.fastq.gz \
-    -2 \${READS_DIR}/\${SAMPLE}_R2.fastq.gz \
-    -S \${OUTPUT_DIR}/\${SAMPLE}.sam
+hisat2 -p "\$SLURM_CPUS_PER_TASK" \
+    -x "\${GENOME%.*}_index" \
+    -1 "\$R1_FILE" \
+    -2 "\$R2_FILE" \
+    -S "\${OUTPUT_DIR}/aligned/\${SAMPLE}.sam"
+
+# Check if SAM file was created
+if [ ! -f "\${OUTPUT_DIR}/aligned/\${SAMPLE}.sam" ]; then
+    echo "Error: SAM file was not created. Exiting."
+    exit 1
+fi
 
 # Convert SAM to BAM, sort, and index
-samtools view -bS \${OUTPUT_DIR}/\${SAMPLE}.sam | \
-    samtools sort -o \${OUTPUT_DIR}/\${SAMPLE}.sorted.bam
-samtools index \${OUTPUT_DIR}/\${SAMPLE}.sorted.bam
+samtools view -bS "\${OUTPUT_DIR}/aligned/\${SAMPLE}.sam" | \
+    samtools sort -o "\${OUTPUT_DIR}/aligned/\${SAMPLE}.sorted.bam"
+samtools index "\${OUTPUT_DIR}/aligned/\${SAMPLE}.sorted.bam"
 
 # StringTie assembly and quantification
-stringtie \${OUTPUT_DIR}/\${SAMPLE}.sorted.bam \
-    -o \${OUTPUT_DIR}/\${SAMPLE}.gtf \
-    -p \$SLURM_CPUS_PER_TASK
+stringtie "\${OUTPUT_DIR}/aligned/\${SAMPLE}.sorted.bam" \
+    -o "\${OUTPUT_DIR}/assembled/\${SAMPLE}.gtf" \
+    -p "\$SLURM_CPUS_PER_TASK"
 
 # Remove intermediate SAM file to save space
-rm \${OUTPUT_DIR}/\${SAMPLE}.sam
+rm "\${OUTPUT_DIR}/aligned/\${SAMPLE}.sam"
 
 # Deactivate Spack environment
-spack env deactivate
+eval "$(spack env deactivate --sh)"
 
+echo "Processing of \${SAMPLE} complete."
 EOF
 
     # Submit the job and store the job ID
-    JOB_ID=$(sbatch ${SCRIPTS_DIR}/process_${sample##*/}.sh | awk '{print $4}')
-    echo $JOB_ID >> ${SCRIPTS_DIR}/sample_job_ids.txt
-done < ${SCRIPTS_DIR}/sample_list.txt
+    JOB_ID=$(sbatch "${SCRIPTS_DIR}/process_${SAMPLE}.sh" | awk '{print $4}')
+    if [ $? -eq 0 ]; then
+      echo "$JOB_ID" >> "${SCRIPTS_DIR}/sample_job_ids.txt"
+      echo "Submitted job $JOB_ID for sample ${SAMPLE}"
+    else
+      echo "Failed to submit job for sample ${SAMPLE}"
+    fi
+done < "${SCRIPTS_DIR}/sample_list_full.txt"
 
-# Create and submit the merge and TransDecoder job
-cat << EOF > ${SCRIPTS_DIR}/merge_and_transdecoder.sh
+# Create the merge and TransDecoder job script
+cat << EOF > "${SCRIPTS_DIR}/merge_and_transdecoder.sh"
 #!/bin/bash
 #SBATCH --job-name=merge_transdecoder
-#SBATCH --output=${OUTPUT_DIR}/logs/merge_transdecoder_%j.out
-#SBATCH --error=${OUTPUT_DIR}/logs/merge_transdecoder_%j.err
+#SBATCH --output="${OUTPUT_DIR}/logs/merge_transdecoder_%j.out"
+#SBATCH --error="${OUTPUT_DIR}/logs/merge_transdecoder_%j.err"
 #SBATCH --time=16:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=20
@@ -103,50 +141,77 @@ cat << EOF > ${SCRIPTS_DIR}/merge_and_transdecoder.sh
 #SBATCH --partition=sapphire
 
 # Load necessary modules
-spack env activate rnaseq_env
+source /n/home00/abakirbas/Desktop/spack/share/spack/setup-env.sh
+# Activate Spack environment in the current shell
+eval "$(spack env activate --sh rnaseq_env)"
 spack load stringtie transdecoder
 
+# Verify SLURM_CPUS_PER_TASK
+echo "SLURM_CPUS_PER_TASK = \$SLURM_CPUS_PER_TASK"
+if [ -z "\$SLURM_CPUS_PER_TASK" ]; then
+    SLURM_CPUS_PER_TASK=20  # Set to the value specified in SBATCH directives
+    echo "SLURM_CPUS_PER_TASK was unset. Setting it to \$SLURM_CPUS_PER_TASK."
+fi
+
 # Merge GTF files
-stringtie --merge -p \$SLURM_CPUS_PER_TASK \
-    -o ${OUTPUT_DIR}/merged.gtf \
-    ${OUTPUT_DIR}/*.gtf
+stringtie --merge -p "\$SLURM_CPUS_PER_TASK" \
+    -o "${OUTPUT_DIR}/merged.gtf" \
+    "${OUTPUT_DIR}/assembled/"*.gtf
 
 # TransDecoder to identify coding regions
-cd $OUTPUT_DIR
+cd "${OUTPUT_DIR}"
 TransDecoder.LongOrfs -t merged.gtf
 TransDecoder.Predict -t merged.gtf
 
 echo "RNA-seq analysis complete!"
 # Deactivate Spack environment
-spack env deactivate
+eval "$(spack env deactivate --sh)"
 
 EOF
 
 # Submit the merge and TransDecoder job with dependency on all sample jobs
-DEPEND_STRING=$(tr '\n' ':' < ${SCRIPTS_DIR}/sample_job_ids.txt | sed 's/:$//')
-sbatch --dependency=afterok:$DEPEND_STRING ${SCRIPTS_DIR}/merge_and_transdecoder.sh
+if [ -s "${SCRIPTS_DIR}/sample_job_ids.txt" ]; then
+  DEPEND_STRING=$(tr '\n' ':' < "${SCRIPTS_DIR}/sample_job_ids.txt" | sed 's/:$//')
+  echo "Submitting merge job with dependencies: $DEPEND_STRING"
+  sbatch --dependency=afterok:$DEPEND_STRING "${SCRIPTS_DIR}/merge_and_transdecoder.sh"
+else
+  echo "No sample jobs were submitted successfully. Skipping merge job."
+fi
 
 # Index the genome (only needs to be done once)
-if [ ! -f ${GENOME}.1.ht2 ]; then
+if [ ! -f "${GENOME}.1.ht2" ]; then
     sbatch << EOF
 #!/bin/bash
 #SBATCH --job-name=hisat2_index
-#SBATCH --output=${OUTPUT_DIR}/logs/hisat2_index_%j.out
-#SBATCH --error=${OUTPUT_DIR}/logs/hisat2_index_%j.err
+#SBATCH --output="${OUTPUT_DIR}/logs/hisat2_index_%j.out"
+#SBATCH --error="${OUTPUT_DIR}/logs/hisat2_index_%j.err"
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=20
 #SBATCH --mem=64G
 #SBATCH --partition=sapphire
 
-# load packages
-spack env activate rnaseq_env
+# Load packages
+source /n/home00/abakirbas/Desktop/spack/share/spack/setup-env.sh
+# Activate Spack environment in the current shell
+eval "$(spack env activate --sh rnaseq_env)"
 spack load hisat2
 
-hisat2-build $GENOME ${GENOME%.*}_index
+GENOME="${GENOME}"
+OUTPUT_DIR="${OUTPUT_DIR}"
+
+# Verify SLURM_CPUS_PER_TASK
+echo "SLURM_CPUS_PER_TASK = \$SLURM_CPUS_PER_TASK"
+if [ -z "\$SLURM_CPUS_PER_TASK" ]; then
+    SLURM_CPUS_PER_TASK=20  # Set to the value specified in SBATCH directives
+    echo "SLURM_CPUS_PER_TASK was unset. Setting it to \$SLURM_CPUS_PER_TASK."
+fi
+
+# Index the genome
+hisat2-build "\$GENOME" "\${GENOME%.*}_index"
 
 # Deactivate Spack environment
-spack env deactivate
+eval "$(spack env deactivate --sh)"
 
 EOF
 fi
